@@ -574,3 +574,195 @@ def test_startup_plan_does_not_modify_record():
     ).json()
     assert again["startup_order"] == resp.json()["startup_order"]
     assert again["peak_imbalance"] == resp.json()["peak_imbalance"]
+
+
+# ---------------------------------------------------------------------------
+# 单相故障保供预演
+# ---------------------------------------------------------------------------
+
+FAULT_PAYLOAD = {
+    "capacities": {"A": 20, "B": 12, "C": 12},
+    "devices": [
+        # H1 固定 B（健康相设备，故障后保持原分配）
+        {"id": "H1", "power": 7, "allowed_phases": ["B"]},
+        # F1/F2 原最优分配均在 A；二者都只允许 A/B
+        {"id": "F1", "power": 5, "allowed_phases": ["A", "B"]},
+        {"id": "F2", "power": 5, "allowed_phases": ["A", "B"]},
+    ],
+}
+
+
+def test_phase_fault_rehearsal_success():
+    created = _create(FAULT_PAYLOAD)
+    calc_id = created["id"]
+    assert created["feasible"] is True
+    # 原记录分配（C 无设备，imbalance 最小化下两台均在 A）：A=10，B=7，C=0
+    assert created["loads"] == {"A": 10, "B": 7, "C": 0}
+
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/phase-fault-rehearsal",
+        params={"fault_phase": "A"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == calc_id
+    assert body["fault_phase"] == "A"
+    assert body["capacities"] == {"A": 20, "B": 12, "C": 12}
+    assert body["original_loads"] == {"A": 10, "B": 7, "C": 0}
+    # A 故障后 B 仅剩 5 空闲：两台 5 功率设备只能迁一台（均不允许 C），
+    # 同功率同数量下序列字典序最小 -> F1 迁 B、F2 断开
+    assert body["loads"] == {"A": 0, "B": 12, "C": 0}
+    assert body["migrations"] == [
+        {"device_id": "F1", "power": 5, "from_phase": "A", "to_phase": "B"}
+    ]
+    assert body["disconnected"] == [
+        {"device_id": "F2", "power": 5, "phase": "A"}
+    ]
+    assert body["retained_power"] == 12
+    assert body["retained_count"] == 2
+    assert body["disconnected_power"] == 5
+    assert body["disconnected_count"] == 1
+    assert "预演" in body["message"]
+    # 健康相负载不超容量，故障相负载为零
+    assert body["loads"]["A"] == 0
+    assert body["loads"]["B"] <= body["capacities"]["B"]
+    assert body["loads"]["C"] <= body["capacities"]["C"]
+
+
+def test_phase_fault_rehearsal_disconnect_when_no_capacity():
+    payload = {
+        "capacities": {"A": 20, "B": 10, "C": 10},
+        "devices": [
+            {"id": "H1", "power": 10, "allowed_phases": ["B"]},
+            {"id": "H2", "power": 10, "allowed_phases": ["C"]},
+            # A 相设备只能在故障相 A，无健康相可迁，必须断开
+            {"id": "F1", "power": 8, "allowed_phases": ["A"]},
+            # A 相设备可迁 B/C，但两相均被占满，亦须断开
+            {"id": "F2", "power": 3, "allowed_phases": ["A", "B", "C"]},
+        ],
+    }
+    created = _create(payload)
+    assert created["feasible"] is True
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/phase-fault-rehearsal",
+        params={"fault_phase": "A"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["loads"] == {"A": 0, "B": 10, "C": 10}
+    assert body["migrations"] == []
+    assert {d["device_id"] for d in body["disconnected"]} == {"F1", "F2"}
+    # 断开列表按设备编号排序，携带功率与原相位
+    assert [d["device_id"] for d in body["disconnected"]] == ["F1", "F2"]
+    assert body["disconnected"][0] == {
+        "device_id": "F1",
+        "power": 8,
+        "phase": "A",
+    }
+    assert body["disconnected_power"] == 11
+    assert body["disconnected_count"] == 2
+    assert body["retained_power"] == 20
+    assert body["retained_count"] == 2
+
+
+def test_phase_fault_rehearsal_other_fault_phases():
+    created = _create(FAULT_PAYLOAD)
+    calc_id = created["id"]
+    # 原记录：F1/F2 在 A（各 5），H1 在 B（7），C 无设备
+    # B 相故障：H1 仅允许 B，无健康相可迁，须断开；F1/F2 作为健康相设备
+    # 保持原分配不动（尽管 A 尚有空闲，亦不迁移）
+    resp_b = client.post(
+        f"/api/v1/calculations/{calc_id}/phase-fault-rehearsal",
+        params={"fault_phase": "B"},
+    )
+    assert resp_b.status_code == 200
+    body_b = resp_b.json()
+    assert body_b["fault_phase"] == "B"
+    assert body_b["loads"] == {"A": 10, "B": 0, "C": 0}
+    assert body_b["migrations"] == []
+    assert body_b["disconnected"] == [
+        {"device_id": "H1", "power": 7, "phase": "B"}
+    ]
+    assert body_b["retained_power"] == 10
+    assert body_b["retained_count"] == 2
+    assert body_b["disconnected_power"] == 7
+
+    # C 相故障：C 相本就无设备，负载与原记录一致（C 为 0）
+    resp_c = client.post(
+        f"/api/v1/calculations/{calc_id}/phase-fault-rehearsal",
+        params={"fault_phase": "C"},
+    )
+    assert resp_c.status_code == 200
+    body_c = resp_c.json()
+    assert body_c["loads"] == {"A": 10, "B": 7, "C": 0}
+    assert body_c["migrations"] == []
+    assert body_c["disconnected"] == []
+    assert body_c["retained_power"] == 17
+    assert body_c["retained_count"] == 3
+
+
+def test_phase_fault_rehearsal_404():
+    resp = client.post(
+        "/api/v1/calculations/999999/phase-fault-rehearsal",
+        params={"fault_phase": "A"},
+    )
+    assert resp.status_code == 404
+
+
+def test_phase_fault_rehearsal_409_when_infeasible():
+    created = _create(INFEASIBLE_UPGRADE_PAYLOAD)
+    assert created["feasible"] is False
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/phase-fault-rehearsal",
+        params={"fault_phase": "A"},
+    )
+    assert resp.status_code == 409
+
+
+def test_phase_fault_rehearsal_invalid_phase():
+    created = _create(FAULT_PAYLOAD)
+    # 故障相取值不在 A/B/C：查询参数校验返回 422
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/phase-fault-rehearsal",
+        params={"fault_phase": "X"},
+    )
+    assert resp.status_code == 422
+
+
+def test_phase_fault_rehearsal_missing_phase_param():
+    created = _create(FAULT_PAYLOAD)
+    # 缺少必填的 fault_phase 查询参数：422
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/phase-fault-rehearsal"
+    )
+    assert resp.status_code == 422
+
+
+def test_phase_fault_rehearsal_does_not_modify_record():
+    created = _create(FAULT_PAYLOAD)
+    calc_id = created["id"]
+    before = client.get(f"/api/v1/calculations/{calc_id}").json()
+    count_before = len(client.get("/api/v1/calculations").json())
+
+    for phase in ("A", "B", "C"):
+        resp = client.post(
+            f"/api/v1/calculations/{calc_id}/phase-fault-rehearsal",
+            params={"fault_phase": phase},
+        )
+        assert resp.status_code == 200
+
+    # 预演不改历史：原记录内容与记录总数均不变
+    after = client.get(f"/api/v1/calculations/{calc_id}").json()
+    assert after == before
+    assert len(client.get("/api/v1/calculations").json()) == count_before
+
+    # 同一故障相重复预演结果确定且相同（幂等读操作）
+    again = client.post(
+        f"/api/v1/calculations/{calc_id}/phase-fault-rehearsal",
+        params={"fault_phase": "A"},
+    ).json()
+    first = client.post(
+        f"/api/v1/calculations/{calc_id}/phase-fault-rehearsal",
+        params={"fault_phase": "A"},
+    ).json()
+    assert again == first

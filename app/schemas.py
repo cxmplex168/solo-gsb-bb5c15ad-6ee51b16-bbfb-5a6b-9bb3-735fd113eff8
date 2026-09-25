@@ -236,3 +236,48 @@ class StartupPlanResult(BaseModel):
         ..., description="逐步的瞬时与稳定负载；无安全顺序时为空"
     )
     message: str
+
+
+class FaultMigrationItem(BaseModel):
+    """一台故障相设备的迁移结果。"""
+
+    device_id: str
+    power: int = Field(..., description="设备功率（正整数）")
+    from_phase: Phase = Field(..., description="原接入相位（即故障相）")
+    to_phase: Phase = Field(..., description="迁入的健康相（A/B/C）")
+
+
+class FaultDisconnectedItem(BaseModel):
+    """一台被断开的故障相设备。"""
+
+    device_id: str
+    power: int = Field(..., description="设备功率（正整数）")
+    phase: Phase = Field(..., description="原接入相位（即故障相）")
+
+
+class PhaseFaultRehearsalResult(BaseModel):
+    """单相故障保供预演结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    fault_phase: Phase = Field(..., description="故障相（A/B/C）")
+    capacities: Loads = Field(..., description="各相容量（沿用原计算记录）")
+    original_loads: Loads = Field(..., description="故障前各相负载（原记录分配）")
+    loads: Loads = Field(
+        ..., description="预演后各相负载（健康相设备不动 + 迁入设备；故障相为 0）"
+    )
+    migrations: list[FaultMigrationItem] = Field(
+        ..., description="迁至健康相的故障相设备（按设备编号排序）"
+    )
+    disconnected: list[FaultDisconnectedItem] = Field(
+        ..., description="被断开的故障相设备（按设备编号排序）"
+    )
+    retained_power: int = Field(
+        ..., ge=0, description="保留设备的总功率（健康相不动设备 + 迁移设备）"
+    )
+    retained_count: int = Field(
+        ..., ge=0, description="保留设备数（健康相不动设备 + 迁移设备）"
+    )
+    disconnected_power: int = Field(..., ge=0, description="断开设备的总功率")
+    disconnected_count: int = Field(..., ge=0, description="断开设备数")
+    message: str

@@ -41,6 +41,17 @@
 编号字典序贪心选边。容量方面：稳定状态负载是最终负载的部分和（记录可行时
 自动满足，求解器仍显式校验以独立成立）；启动瞬间需校验
 「启动前该相负载 + 启动功率 ≤ 该相容量」（其余相与稳定状态相同）。
+
+单相故障保供预演（solve_phase_fault_rehearsal）：给定一条已有可行分配的
+记录与故障相，健康相设备保持原分配不动（其负载构成各健康相的初始负载），
+故障相设备只能迁至其允许的健康相（不得使该相超容量）或断开，故障相最终
+负载必为零。全部断开总是可行，故问题总有应急方案。目标依次为：
+1) 保留设备的总功率最大；2) 再使保留设备数最多；3) 仍同值时，按故障相
+设备编号排序，取相位选择序列字典序最小者（A＜B＜C＜断开）。只需对故障相
+设备（至多 12 台）做 DFS，每台按「允许的健康相 A→B→C，最后断开」的顺序
+展开，故完整方案按选择序列字典序依次产生，仅在 (保留功率, 保留设备数)
+严格更优时更新，同值自然保留字典序最小方案；并以剩余设备功率和 / 数量和
+做乐观上界剪枝。
 """
 
 from __future__ import annotations
@@ -668,4 +679,189 @@ def solve_startup_plan(
         order=tuple(ordered[i].code for i in order_idx),
         steps=tuple(steps),
         peak_imbalance=peak,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 单相故障保供预演
+# ---------------------------------------------------------------------------
+
+# 相位选择的字典序：A＜B＜C＜断开（断开用 "D" 内部标记）
+_DISCONNECT: str = "D"
+
+
+@dataclass(frozen=True)
+class FaultRehearsalDevice:
+    """单相故障预演输入设备（沿用可行计算记录的功率、允许相位与原分配）。"""
+
+    code: str  # 设备唯一编号
+    power: int  # 正整数功率
+    allowed: tuple[str, ...]  # 可接入相位集合（PHASES 的非空子集）
+    original_phase: str  # 记录中的原接入相位（A/B/C）
+
+
+@dataclass(frozen=True)
+class FaultRehearsalMigration:
+    """一台故障相设备的迁移结果。"""
+
+    code: str  # 设备编号
+    power: int  # 设备功率
+    from_phase: str  # 原接入相位（即故障相）
+    to_phase: str  # 迁入的健康相（A/B/C）
+
+
+@dataclass(frozen=True)
+class FaultRehearsalDisconnect:
+    """一台被断开的故障相设备。"""
+
+    code: str  # 设备编号
+    power: int  # 设备功率
+    phase: str  # 原接入相位（即故障相）
+
+
+@dataclass(frozen=True)
+class FaultRehearsalResult:
+    """单相故障保供预演结果（断开总是可行，故无 feasible=False 情形）。"""
+
+    fault_phase: str  # 故障相
+    capacities: dict[str, int]  # 各相容量（沿用记录）
+    original_loads: dict[str, int]  # 故障前各相负载（记录中的分配负载）
+    loads: dict[str, int]  # 预演后各相负载（故障相必为零）
+    migrations: tuple[FaultRehearsalMigration, ...]  # 迁移的故障相设备（按编号排序）
+    disconnected: tuple[FaultRehearsalDisconnect, ...]  # 断开的故障相设备（按编号排序）
+    retained_power: int  # 保留设备的总功率（含健康相不动设备）
+    retained_count: int  # 保留设备数（含健康相不动设备）
+    disconnected_power: int  # 断开设备的总功率
+    disconnected_count: int  # 断开设备数
+    choice_sequence: tuple[str, ...]  # 按故障相设备编号排序的相位选择序列
+
+
+def solve_phase_fault_rehearsal(
+    devices: Iterable[FaultRehearsalDevice],
+    capacities: dict[str, int],
+    fault_phase: str,
+) -> FaultRehearsalResult:
+    """求解单相故障保供预演。
+
+    健康相设备保持原分配不动；故障相设备依次选择「允许接入的健康相（A→B→C）
+    或断开」。迁至健康相时该相负载不得超过容量。目标依次为：保留设备总功率
+    最大 → 保留设备数最多 → 按故障相设备编号排序的相位选择序列字典序最小
+    （A＜B＜C＜断开）。故障相最终负载恒为零；全部断开恒可行。
+
+    :param devices: 设备集合（编号唯一、功率正整数、允许相位非空且含原相位）。
+    :param capacities: 各相容量，形如 {"A": int, "B": int, "C": int}。
+    :param fault_phase: 故障相（"A"/"B"/"C"）。
+    :return: FaultRehearsalResult。
+    """
+    ordered_all = sorted(devices, key=lambda d: d.code)
+    healthy_devices = [d for d in ordered_all if d.original_phase != fault_phase]
+    fault_devices = [d for d in ordered_all if d.original_phase == fault_phase]
+    healthy_phases = [p for p in PHASES if p != fault_phase]
+    caps = {p: capacities[p] for p in PHASES}
+
+    # 故障前各相负载：全部设备按记录中的原相位累加
+    original_loads = {p: 0 for p in PHASES}
+    for device in ordered_all:
+        original_loads[device.original_phase] += device.power
+
+    # 健康相设备保持原分配：构成健康相的初始（不可迁出）负载
+    initial_loads = {p: 0 for p in PHASES}
+    retained_power_fixed = 0
+    for device in healthy_devices:
+        initial_loads[device.original_phase] += device.power
+        retained_power_fixed += device.power
+    retained_count_fixed = len(healthy_devices)
+
+    m = len(fault_devices)
+    powers = [d.power for d in fault_devices]
+    # 每台故障相设备的可选动作：允许的健康相（按 A/B/C 顺序），末尾为断开
+    options: list[list[str]] = []
+    for device in fault_devices:
+        moves = [p for p in healthy_phases if p in device.allowed]
+        options.append(moves + [_DISCONNECT])
+
+    # suffix_power[i] / suffix_count：第 i..m-1 台故障设备的功率和 / 数量（剪枝用）
+    suffix_power = [0] * (m + 1)
+    for i in range(m - 1, -1, -1):
+        suffix_power[i] = suffix_power[i + 1] + powers[i]
+
+    loads = dict(initial_loads)
+    current: list[Optional[str]] = [None] * m
+    # 最优值（仅统计故障相设备中被保留的部分）：总功率优先，设备数次之
+    best_power: Optional[int] = None
+    best_count: Optional[int] = None
+    best_choices: Optional[list[str]] = None
+
+    def dfs(i: int, kept_power: int, kept_count: int) -> None:
+        nonlocal best_power, best_count, best_choices
+        if i == m:
+            # 仅 (保留功率, 保留设备数) 严格更优才更新；同值时先枚举到的
+            # 方案选择序列字典序更小（选项按 A→B→C→断开 顺序展开）
+            if (
+                best_power is None
+                or (kept_power, kept_count) > (best_power, best_count)
+            ):
+                best_power = kept_power
+                best_count = kept_count
+                best_choices = current.copy()
+            return
+        # 乐观上界剪枝：即使剩余故障设备全部保留
+        if best_power is not None:
+            upper_power = kept_power + suffix_power[i]
+            if upper_power < best_power:
+                return
+            if upper_power == best_power and kept_count + (m - i) < (best_count or 0):
+                return
+        for choice in options[i]:
+            if choice == _DISCONNECT:
+                current[i] = choice
+                dfs(i + 1, kept_power, kept_count)
+                current[i] = None
+            elif loads[choice] + powers[i] <= caps[choice]:
+                loads[choice] += powers[i]
+                current[i] = choice
+                dfs(i + 1, kept_power + powers[i], kept_count + 1)
+                loads[choice] -= powers[i]
+                current[i] = None
+
+    dfs(0, 0, 0)
+
+    assert best_choices is not None  # 断开总是可行
+    final_loads = dict(initial_loads)
+    migrations: list[FaultRehearsalMigration] = []
+    disconnected: list[FaultRehearsalDisconnect] = []
+    for idx, choice in enumerate(best_choices):
+        device = fault_devices[idx]
+        if choice == _DISCONNECT:
+            disconnected.append(
+                FaultRehearsalDisconnect(
+                    code=device.code, power=device.power, phase=fault_phase
+                )
+            )
+        else:
+            final_loads[choice] += powers[idx]
+            migrations.append(
+                FaultRehearsalMigration(
+                    code=device.code,
+                    power=device.power,
+                    from_phase=fault_phase,
+                    to_phase=choice,
+                )
+            )
+    final_loads[fault_phase] = 0
+
+    migrations.sort(key=lambda item: item.code)
+    disconnected.sort(key=lambda item: item.code)
+    return FaultRehearsalResult(
+        fault_phase=fault_phase,
+        capacities=dict(caps),
+        original_loads=original_loads,
+        loads=final_loads,
+        migrations=tuple(migrations),
+        disconnected=tuple(disconnected),
+        retained_power=retained_power_fixed + (best_power or 0),
+        retained_count=retained_count_fixed + (best_count or 0),
+        disconnected_power=sum(item.power for item in disconnected),
+        disconnected_count=len(disconnected),
+        choice_sequence=tuple(best_choices),
     )

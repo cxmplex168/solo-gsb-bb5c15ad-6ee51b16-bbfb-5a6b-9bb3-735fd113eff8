@@ -6,10 +6,12 @@ import unittest
 
 from app.solver import (
     Device,
+    FaultRehearsalDevice,
     RobustDevice,
     StartupDevice,
     solve,
     solve_capacity_upgrade,
+    solve_phase_fault_rehearsal,
     solve_robust,
     solve_startup_plan,
 )
@@ -789,6 +791,374 @@ class StartupPlanFuzzTest(unittest.TestCase):
         )
         self.assertEqual(result.peak_imbalance, 13)
         self._simulate_and_check(result, devices, caps)
+
+
+def brute_force_fault(devices, capacities, fault_phase):
+    """单相故障保供预演的朴素全枚举参照实现。
+
+    健康相设备保持原分配；故障相设备可选「允许的健康相（按 A/B/C 顺序）」
+    或断开（标记 "D"）。按 (保留功率, 保留数量, 选择序列) 取最优——
+    保留功率/数量越大越好，同值时序列字典序越小越好（"A"<"B"<"C"<"D"）。
+    返回 (选择序列, 最终负载, 迁移字典, 断开列表, 保留功率, 保留数量)。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    fault = [d for d in ordered if d.original_phase == fault_phase]
+    healthy = [d for d in ordered if d.original_phase != fault_phase]
+    healthy_phases = [p for p in PHASES if p != fault_phase]
+
+    initial = {p: 0 for p in PHASES}
+    fixed_power = 0
+    for d in healthy:
+        initial[d.original_phase] += d.power
+        fixed_power += d.power
+
+    options = []
+    for d in fault:
+        moves = [p for p in healthy_phases if p in d.allowed]
+        options.append(moves + ["D"])
+
+    best = None
+    for combo in itertools.product(*options):
+        loads = dict(initial)
+        ok = True
+        kept_power = 0
+        for d, choice in zip(fault, combo):
+            if choice != "D":
+                loads[choice] += d.power
+                if loads[choice] > capacities[choice]:
+                    ok = False
+                    break
+                kept_power += d.power
+        if not ok:
+            continue
+        kept_count = len(healthy) + sum(1 for c in combo if c != "D")
+        key = (-kept_power - fixed_power, -kept_count, combo)
+        if best is None or key < best[0]:
+            migrations = {
+                d.code: choice
+                for d, choice in zip(fault, combo)
+                if choice != "D"
+            }
+            disconnected = [d.code for d, choice in zip(fault, combo) if choice == "D"]
+            loads[fault_phase] = 0
+            best = (
+                key,
+                combo,
+                dict(loads),
+                migrations,
+                disconnected,
+                kept_power + fixed_power,
+                kept_count,
+            )
+    return best
+
+
+class PhaseFaultRehearsalTest(unittest.TestCase):
+    def test_healthy_devices_keep_assignment_and_migrate(self):
+        # 健康相设备不动；两台 A 相设备迁至 B/C（B 有 5 空闲，C 有 10）
+        devices = [
+            FaultRehearsalDevice("H1", 5, ("B",), "B"),
+            FaultRehearsalDevice("M1", 10, ("A", "B", "C"), "A"),
+            FaultRehearsalDevice("M2", 6, ("B", "C"), "A"),
+        ]
+        caps = {"A": 100, "B": 10, "C": 10}
+        result = solve_phase_fault_rehearsal(devices, caps, "A")
+        self.assertEqual(result.fault_phase, "A")
+        self.assertEqual(result.original_loads, {"A": 16, "B": 5, "C": 0})
+        # M1(10) 只能迁 C；M2(6) 迁 C 会与 M1 一起占满 C（10+6>10），
+        # 迁 B 又超容量（5+6>10），故 M2 断开
+        self.assertEqual(result.loads, {"A": 0, "B": 5, "C": 10})
+        self.assertEqual(
+            [(m.code, m.from_phase, m.to_phase) for m in result.migrations],
+            [("M1", "A", "C")],
+        )
+        self.assertEqual(
+            [(d.code, d.power, d.phase) for d in result.disconnected],
+            [("M2", 6, "A")],
+        )
+        self.assertEqual(result.retained_power, 15)
+        self.assertEqual(result.retained_count, 2)
+        self.assertEqual(result.disconnected_power, 6)
+        self.assertEqual(result.disconnected_count, 1)
+        self.assertEqual(result.choice_sequence, ("C", "D"))
+
+    def test_all_devices_retained(self):
+        # 两台 A 相设备均可迁 B/C 且容量充裕：全部保留；
+        # 全保留方案中序列 (B,B) 字典序最小
+        devices = [
+            FaultRehearsalDevice("M1", 4, ("A", "B", "C"), "A"),
+            FaultRehearsalDevice("M2", 4, ("B", "C"), "A"),
+        ]
+        caps = {"A": 100, "B": 10, "C": 10}
+        result = solve_phase_fault_rehearsal(devices, caps, "A")
+        self.assertEqual(result.loads, {"A": 0, "B": 8, "C": 0})
+        self.assertEqual(result.retained_power, 8)
+        self.assertEqual(result.retained_count, 2)
+        self.assertEqual(result.disconnected, ())
+        self.assertEqual(
+            [(m.code, m.to_phase) for m in result.migrations],
+            [("M1", "B"), ("M2", "B")],
+        )
+        self.assertEqual(result.choice_sequence, ("B", "B"))
+
+    def test_maximize_power_before_count(self):
+        # 只能利用 B 相（其余健康相 C 容量为 0）：留下两台小设备（共 6）或
+        # 一台大设备（10），总功率优先 -> 保留大设备，尽管设备数更少
+        devices = [
+            FaultRehearsalDevice("M1", 3, ("A", "B"), "A"),
+            FaultRehearsalDevice("M2", 3, ("A", "B"), "A"),
+            FaultRehearsalDevice("M3", 10, ("A", "B"), "A"),
+        ]
+        caps = {"A": 100, "B": 10, "C": 0}
+        result = solve_phase_fault_rehearsal(devices, caps, "A")
+        self.assertEqual(result.retained_power, 10)
+        self.assertEqual(result.retained_count, 1)
+        self.assertEqual(result.loads, {"A": 0, "B": 10, "C": 0})
+        self.assertEqual([m.code for m in result.migrations], ["M3"])
+        self.assertEqual(
+            [d.code for d in result.disconnected], ["M1", "M2"]
+        )
+        # M1、M2 断开，M3 迁 B：序列 (D, D, B)
+        self.assertEqual(result.choice_sequence, ("D", "D", "B"))
+
+    def test_maximize_count_on_equal_power(self):
+        # 单台 6 与两台 3 只能竞用 B 相 6 容量：总功率相同，取设备数多者
+        devices = [
+            FaultRehearsalDevice("M1", 3, ("A", "B"), "A"),
+            FaultRehearsalDevice("M2", 3, ("A", "B"), "A"),
+            FaultRehearsalDevice("M3", 6, ("A", "B"), "A"),
+        ]
+        caps = {"A": 100, "B": 6, "C": 0}
+        result = solve_phase_fault_rehearsal(devices, caps, "A")
+        self.assertEqual(result.retained_power, 6)
+        self.assertEqual(result.retained_count, 2)
+        self.assertEqual(result.loads, {"A": 0, "B": 6, "C": 0})
+        self.assertEqual(
+            [m.code for m in result.migrations], ["M1", "M2"]
+        )
+        self.assertEqual([d.code for d in result.disconnected], ["M3"])
+        self.assertEqual(result.choice_sequence, ("B", "B", "D"))
+
+    def test_lexicographic_tie_break_prefers_healthy_phase(self):
+        # 功率与设备数都相同的方案间：同编号设备可迁 B 或 C 时取序号更小的 B
+        devices = [
+            FaultRehearsalDevice("M1", 4, ("B", "C"), "A"),
+            FaultRehearsalDevice("M2", 4, ("B", "C"), "A"),
+        ]
+        caps = {"A": 100, "B": 10, "C": 10}
+        result = solve_phase_fault_rehearsal(devices, caps, "A")
+        # (B,B) 与 (B,C)/(C,B)/(C,C) 同为全保留，取字典序最小 (B,B)
+        self.assertEqual(result.choice_sequence, ("B", "B"))
+        self.assertEqual(result.loads, {"A": 0, "B": 8, "C": 0})
+        self.assertEqual(
+            [(m.code, m.to_phase) for m in result.migrations],
+            [("M1", "B"), ("M2", "B")],
+        )
+
+    def test_lexicographic_order_disconnect_last(self):
+        # 迁移与断开在同功率方案间：A＜B＜C＜断开，能迁移时不优先断开
+        devices = [
+            FaultRehearsalDevice("M1", 4, ("C",), "A"),
+            FaultRehearsalDevice("M2", 4, ("B",), "A"),
+        ]
+        caps = {"A": 100, "B": 4, "C": 4}
+        result = solve_phase_fault_rehearsal(devices, caps, "A")
+        # 两台均可保留（分别只能迁 C、B）：序列按编号排序为 (C, B)
+        self.assertEqual(result.choice_sequence, ("C", "B"))
+        self.assertEqual(result.retained_count, 2)
+        self.assertEqual(result.loads, {"A": 0, "B": 4, "C": 4})
+
+    def test_fault_only_device_without_healthy_option_disconnected(self):
+        # 故障相设备的允许相位只含故障相：只能断开
+        devices = [
+            FaultRehearsalDevice("F1", 9, ("A",), "A"),
+            FaultRehearsalDevice("H1", 3, ("B",), "B"),
+        ]
+        result = solve_phase_fault_rehearsal(
+            devices, {"A": 100, "B": 100, "C": 100}, "A"
+        )
+        self.assertEqual(result.loads, {"A": 0, "B": 3, "C": 0})
+        self.assertEqual(result.migrations, ())
+        self.assertEqual([d.code for d in result.disconnected], ["F1"])
+        self.assertEqual(result.choice_sequence, ("D",))
+        self.assertEqual(result.retained_power, 3)
+        self.assertEqual(result.retained_count, 1)
+
+    def test_no_fault_devices(self):
+        # 故障相本就无设备：负载不变，迁移 / 断开均为空
+        devices = [
+            FaultRehearsalDevice("H1", 5, ("B",), "B"),
+            FaultRehearsalDevice("H2", 7, ("C",), "C"),
+        ]
+        result = solve_phase_fault_rehearsal(
+            devices, {"A": 10, "B": 10, "C": 10}, "A"
+        )
+        self.assertEqual(result.original_loads, {"A": 0, "B": 5, "C": 7})
+        self.assertEqual(result.loads, {"A": 0, "B": 5, "C": 7})
+        self.assertEqual(result.migrations, ())
+        self.assertEqual(result.disconnected, ())
+        self.assertEqual(result.retained_power, 12)
+        self.assertEqual(result.retained_count, 2)
+        self.assertEqual(result.choice_sequence, ())
+
+    def test_fault_with_b_and_c_healthy_phases(self):
+        # B 相故障：健康相为 A、C，选项顺序 A→C→断开
+        devices = [
+            FaultRehearsalDevice("F1", 4, ("A", "B"), "B"),
+            FaultRehearsalDevice("H1", 2, ("A",), "A"),
+        ]
+        result = solve_phase_fault_rehearsal(
+            devices, {"A": 10, "B": 10, "C": 10}, "B"
+        )
+        self.assertEqual(result.loads, {"A": 6, "B": 0, "C": 0})
+        self.assertEqual([m.code for m in result.migrations], ["F1"])
+        self.assertEqual(result.migrations[0].to_phase, "A")
+        self.assertEqual(result.choice_sequence, ("A",))
+
+    def test_capacity_never_exceeded(self):
+        # 健康相已被占满：故障相设备无容量可迁，全部断开
+        devices = [
+            FaultRehearsalDevice("F1", 5, ("B", "C"), "A"),
+            FaultRehearsalDevice("F2", 5, ("B", "C"), "A"),
+            FaultRehearsalDevice("H1", 10, ("B",), "B"),
+            FaultRehearsalDevice("H2", 10, ("C",), "C"),
+        ]
+        caps = {"A": 100, "B": 10, "C": 10}
+        result = solve_phase_fault_rehearsal(devices, caps, "A")
+        self.assertEqual(result.loads, {"A": 0, "B": 10, "C": 10})
+        self.assertEqual(result.migrations, ())
+        self.assertEqual(
+            [d.code for d in result.disconnected], ["F1", "F2"]
+        )
+        self.assertEqual(result.choice_sequence, ("D", "D"))
+        self.assertEqual(result.retained_power, 20)
+        self.assertEqual(result.retained_count, 2)
+
+
+class PhaseFaultRehearsalFuzzTest(unittest.TestCase):
+    """与朴素全枚举参照实现做随机对拍。"""
+
+    def _check_against(self, devices, capacities, fault_phase):
+        result = solve_phase_fault_rehearsal(devices, capacities, fault_phase)
+        expected = brute_force_fault(devices, capacities, fault_phase)
+        self.assertIsNotNone(expected)  # 全断开恒可行
+        _, exp_combo, exp_loads, exp_migrations, exp_disconnected, exp_power, exp_count = expected
+        self.assertEqual(result.loads, exp_loads)
+        self.assertEqual(result.retained_power, exp_power)
+        self.assertEqual(result.retained_count, exp_count)
+        actual_migrations = {m.code: m.to_phase for m in result.migrations}
+        self.assertEqual(actual_migrations, exp_migrations)
+        self.assertEqual(
+            [d.code for d in result.disconnected], exp_disconnected
+        )
+        ordered_fault = sorted(
+            (d for d in devices if d.original_phase == fault_phase),
+            key=lambda d: d.code,
+        )
+        self.assertEqual(
+            result.choice_sequence,
+            tuple(exp_combo),
+        )
+        self.assertEqual(len(result.choice_sequence), len(ordered_fault))
+        # 自洽性：故障相负载为零，健康相负载不超容量
+        self.assertEqual(result.loads[fault_phase], 0)
+        for p in PHASES:
+            self.assertLessEqual(result.loads[p], capacities[p])
+        self.assertEqual(
+            result.disconnected_power,
+            sum(d.power for d in result.disconnected),
+        )
+        total_power = sum(d.power for d in devices)
+        self.assertEqual(
+            result.retained_power + result.disconnected_power, total_power
+        )
+        self.assertEqual(
+            result.retained_count + result.disconnected_count, len(devices)
+        )
+
+    def test_against_brute_force(self):
+        rng = random.Random(20260930)
+        for case in range(500):
+            n = rng.randint(1, 7)
+            devices = []
+            original_loads = {p: 0 for p in PHASES}
+            for i in range(n):
+                allowed = tuple(p for p in PHASES if rng.random() < 0.7) or ("A",)
+                # 原相位取自允许集合（模拟可行计算记录的分配结果）
+                original_phase = rng.choice(allowed)
+                power = rng.randint(1, 20)
+                devices.append(
+                    FaultRehearsalDevice(
+                        f"DEV-{i}", power, allowed, original_phase
+                    )
+                )
+                original_loads[original_phase] += power
+            # 容量不低于原分配负载（记录可行），叠加随机余量以同时覆盖
+            # 「无迁移空间」与「有迁移空间」两类情形
+            capacities = {
+                p: original_loads[p] + rng.randint(0, 30) for p in PHASES
+            }
+            fault_phase = PHASES[case % 3]
+            self._check_against(devices, capacities, fault_phase)
+
+    def test_twelve_devices_performance(self):
+        # 12 台设备全部位于故障相、全相位可接、紧容量：求解器须在极短时间内
+        # 完成（剪枝后实际枚举远小于 4^12），并保证结果自洽
+        devices = [
+            FaultRehearsalDevice(
+                f"D{i:02d}", 2 * i + 1, PHASES, "A"
+            )
+            for i in range(12)
+        ]
+        capacities = {"A": 10**6, "B": 40, "C": 50}
+        result = solve_phase_fault_rehearsal(devices, capacities, "A")
+        self.assertEqual(result.loads["A"], 0)
+        for p in PHASES:
+            self.assertLessEqual(result.loads[p], capacities[p])
+        # 保留功率 + 断开功率 = 全部设备总功率；保留数 + 断开数 = 设备总数
+        total_power = sum(d.power for d in devices)
+        self.assertEqual(
+            result.retained_power + result.disconnected_power, total_power
+        )
+        self.assertEqual(
+            result.retained_count + result.disconnected_count, 12
+        )
+        # 选择序列长度等于故障相设备数，元素取自 B/C/D
+        self.assertEqual(len(result.choice_sequence), 12)
+        self.assertTrue(all(c in ("B", "C", "D") for c in result.choice_sequence))
+        # B/C 上保留的功率即保留总功率（无健康相设备），且不超容量
+        self.assertEqual(
+            result.retained_power, result.loads["B"] + result.loads["C"]
+        )
+
+    def test_nine_devices_against_brute_force(self):
+        # 9 台故障相设备对拍：4^9 ≈ 26 万全枚举，紧容量下大量组合
+        # 被容量约束提前终止，覆盖较大规模下的最优性与字典序
+        devices = [
+            FaultRehearsalDevice(f"D{i:02d}", 2 * i + 1, PHASES, "A")
+            for i in range(9)
+        ]
+        capacities = {"A": 10**6, "B": 30, "C": 30}
+        result = solve_phase_fault_rehearsal(devices, capacities, "A")
+        expected = brute_force_fault(devices, capacities, "A")
+        self.assertEqual(result.retained_power, expected[5])
+        self.assertEqual(result.retained_count, expected[6])
+        self.assertEqual(result.choice_sequence, expected[1])
+        self.assertEqual(result.loads, expected[2])
+
+    def test_twelve_devices_all_fault_phase_tight(self):
+        # 极端情形：无健康相设备，所有设备只能断开（允许相位仅故障相）
+        devices = [
+            FaultRehearsalDevice(f"D{i:02d}", i + 1, ("A",), "A")
+            for i in range(12)
+        ]
+        caps = {"A": 100, "B": 100, "C": 100}
+        result = solve_phase_fault_rehearsal(devices, caps, "A")
+        self.assertEqual(result.loads, {"A": 0, "B": 0, "C": 0})
+        self.assertEqual(result.migrations, ())
+        self.assertEqual(result.disconnected_count, 12)
+        self.assertEqual(result.retained_power, 0)
+        self.assertEqual(result.choice_sequence, ("D",) * 12)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,11 @@
 （启动瞬间按启动功率计，完成后按额定功率持续运行），求解使**全过程三相负载最大值
 与最小值之差的峰值**最小的启动顺序。预演同样**不修改历史记录**。
 
+此外，服务还提供**单相故障保供预演**接口：对已有可行分配的记录指定一个故障相，
+健康相设备保持原分配，故障相设备只能迁至其允许的健康相（不得超容量）或断开，
+在所有应急方案中**先最大化保留设备的总功率，再最大化保留设备数**，同值时取
+相位选择序列字典序最小者。预演同样**不修改历史记录**。
+
 ## 快速开始（一键启动）
 
 前置条件：已安装 Docker 与 Docker Compose 插件。
@@ -61,6 +66,7 @@ docker compose up --build
 | `GET` | `/api/v1/calculations/{id}` | 查询单条记录详情（含原始输入设备与分配结果） |
 | `POST` | `/api/v1/calculations/{id}/capacity-upgrade` | 为「无可行分配」的记录给出最小扩容建议（原记录不变） |
 | `POST` | `/api/v1/calculations/{id}/startup-plan` | 为「有可行分配」的记录预演负载差峰值最小的安全启动顺序（原记录不变） |
+| `POST` | `/api/v1/calculations/{id}/phase-fault-rehearsal` | 为「有可行分配」的记录预演单相故障下的保供迁移 / 断开方案（原记录不变） |
 | `POST` | `/api/v1/robust-rehearsals` | 稳健分相预演：设备功率为区间，求任意功率组合下均不超容量的最优分配（不持久化） |
 | `GET` | `/health` | 健康检查 |
 
@@ -395,6 +401,85 @@ curl -X POST http://localhost:8000/api/v1/calculations/1/startup-plan \
 - 每台设备的 `startup_power` 为**正整数**，且**不低于其额定功率**；
 - 记录不存在返回 `404`；原记录 `feasible=false` 返回 `409`。
 
+## 单相故障保供预演
+
+`POST /api/v1/calculations/{id}/phase-fault-rehearsal?fault_phase=A` 用于在某一相
+发生故障时预演应急保供方案。故障相通过查询参数 `fault_phase` 指定（取值 `A`/`B`/`C`）：
+
+- **健康相上的设备保持原分配不动**（不迁移、不参与重新优化）；
+- **故障相设备**只能迁至其**允许接入的健康相**，迁入后该相负载**不得超过容量**，
+  也可以**断开**；故障相最终负载**必为零**。
+
+在所有满足约束的应急方案中，目标依次为：
+
+1. **最大化保留设备的总功率**（`retained_power`，含健康相上保持原分配的设备）；
+2. 总功率相同时，**最大化保留设备数**（`retained_count`）；
+3. 仍相同时，按**故障相设备编号排序**，取其**相位选择序列字典序最小**者，
+   单项次序为 **A＜B＜C＜断开**（只在允许的健康相中选择）。
+
+全部故障相设备断开总是可行，因此该接口不返回 `feasible=false`。接口**只做预演，
+不修改历史计算记录**。记录不存在返回 `404`；原记录无可行分配（`feasible=false`）
+返回 `409`；`fault_phase` 缺失或取值非法返回 `422`。
+
+### 请求示例
+
+```bash
+# 先创建一条可行计算记录（F1/F2 接 A，H1 接 B）
+curl -X POST http://localhost:8000/api/v1/calculations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "capacities": {"A": 20, "B": 12, "C": 12},
+    "devices": [
+      {"id": "H1", "power": 7, "allowed_phases": ["B"]},
+      {"id": "F1", "power": 5, "allowed_phases": ["A", "B"]},
+      {"id": "F2", "power": 5, "allowed_phases": ["A", "B"]}
+    ]
+  }'
+
+# 再对该记录预演 A 相故障（假设记录 id 为 1）
+curl -X POST "http://localhost:8000/api/v1/calculations/1/phase-fault-rehearsal?fault_phase=A"
+```
+
+原记录负载为 `{A: 10, B: 7, C: 0}`。A 相故障后，B 相仅剩 `12 - 7 = 5` 空闲，
+两台功率均为 5 的故障相设备最多迁一台至 B（均不允许 C）；保留总功率与设备数
+相同，故取相位选择序列字典序最小者——编号较小的 `F1` 迁 B，`F2` 断开。
+
+### 响应示例
+
+```json
+{
+  "id": 1,
+  "created_at": "2026-09-25T08:00:00.000000+00:00",
+  "fault_phase": "A",
+  "capacities": {"A": 20, "B": 12, "C": 12},
+  "original_loads": {"A": 10, "B": 7, "C": 0},
+  "loads": {"A": 0, "B": 12, "C": 0},
+  "migrations": [
+    {"device_id": "F1", "power": 5, "from_phase": "A", "to_phase": "B"}
+  ],
+  "disconnected": [
+    {"device_id": "F2", "power": 5, "phase": "A"}
+  ],
+  "retained_power": 12,
+  "retained_count": 2,
+  "disconnected_power": 5,
+  "disconnected_count": 1,
+  "message": "预演成功：健康相设备保持原分配，故障相设备在允许健康相不超容量的前提下，已找到保留总功率最大、再保留设备数最多，且相位选择序列字典序最小的保供方案"
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `fault_phase` | 故障相（A/B/C） |
+| `original_loads` | 故障前各相负载（原记录的分配负载，含故障相设备） |
+| `loads` | 预演后各相负载（健康相不动设备 + 迁入设备；故障相恒为 `0`，各相不超容量） |
+| `migrations` | 迁至健康相的故障相设备（按设备编号排序），含功率、原相位与迁入相位 |
+| `disconnected` | 被断开的故障相设备（按设备编号排序），含功率与原相位 |
+| `retained_power` / `retained_count` | 保留设备（健康相不动设备 + 迁移设备）的总功率 / 数量 |
+| `disconnected_power` / `disconnected_count` | 断开设备的总功率 / 数量 |
+
 ## 本地开发
 
 ```bash
@@ -456,3 +541,12 @@ python3 -m unittest tests.test_solver  # 仅求解器测试（无第三方依赖
 先自全集反向递推「途经负载差均不超最优峰值、且满足容量时可达全集」的集合，再从
 空集出发每一步选取「后缀仍可完成」的编号最小设备，所得顺序即同峰值下设备编号
 序列字典序最小者。
+
+**单相故障保供预演**（`phase-fault-rehearsal`）只需对故障相设备（至多 12 台）做
+DFS：健康相设备保持原分配，其负载预先计入健康相；每台故障相设备的可选动作按
+「允许接入的健康相 A→B→C，最后断开」展开，故完整方案天然按「设备编号排序后的
+相位选择序列」字典序（A＜B＜C＜断开）依次产生。目标键为 `(保留功率, 保留设备数)`，
+均只统计故障相设备中被保留的部分（健康相部分为常量），仅在严格更优时更新最优解，
+同值自然保留字典序最小方案。配合「剩余设备全部保留也无法超过当前最优」的功率 /
+数量乐观上界剪枝，12 台设备的最坏情形亦可瞬时完成；全部断开恒可行，故障相负载
+恒为零。
