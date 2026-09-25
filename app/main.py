@@ -14,7 +14,10 @@ from .schemas import (
     CalculationResult,
     CalculationSummary,
     CapacityUpgradeResult,
+    FaultRehearsalResult,
     Loads,
+    MigrationItem,
+    Phase,
     RobustRehearsalRequest,
     RobustRehearsalResult,
     StartupPlanRequest,
@@ -27,6 +30,7 @@ from .solver import (
     StartupDevice,
     solve,
     solve_capacity_upgrade,
+    solve_fault_rehearsal,
     solve_robust,
     solve_startup_plan,
 )
@@ -50,6 +54,10 @@ _MESSAGE_STARTUP_FEASIBLE = (
 _MESSAGE_STARTUP_INFEASIBLE = (
     "无安全启动顺序：不存在每个启动瞬间及稳定状态各相均不超容量的启动顺序"
 )
+_MESSAGE_FAULT = (
+    "保供预演成功：已在健康相设备保持原分配、故障相负载为零的前提下，"
+    "找到保留总功率最大、保留设备数最多，且故障相设备选择序列字典序最小的方案"
+)
 
 
 @asynccontextmanager
@@ -71,6 +79,9 @@ app = FastAPI(
         "对已有可行分配的计算记录，还可做启动顺序预演：逐台给定启动瞬时功率，"
         "在固定相位与容量下求解全过程三相负载差峰值最小的一台接一台启动顺序"
         "（仅预演，不修改历史记录）。"
+        "对已有可行分配的计算记录，还可做单相故障保供预演：指定故障相位后，"
+        "健康相设备保持原分配，故障相设备迁入允许的健康相或断开，在健康相不超"
+        "容量、故障相负载为零下最大化保留总功率与保留设备数（仅预演，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -375,4 +386,73 @@ def startup_plan(calculation_id: int, payload: StartupPlanRequest) -> StartupPla
         message=(
             _MESSAGE_STARTUP_FEASIBLE if result.feasible else _MESSAGE_STARTUP_INFEASIBLE
         ),
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/fault-rehearsal",
+    response_model=FaultRehearsalResult,
+    tags=["calculations"],
+)
+def fault_rehearsal(
+    calculation_id: int,
+    fault_phase: Phase = Query(..., description="故障相位，取值 A / B / C"),
+) -> FaultRehearsalResult:
+    """单相故障保供预演：按记录 ID 与故障相位推演保供方案。
+
+    健康相上的设备保持原分配不动；故障相设备只能迁入其允许的健康相（不得使
+    任何健康相超容量），也可以断开，故障相最终负载必须为零。在所有方案中：
+    先最大化保留设备的总功率（``retained_power``），再最大化保留设备数
+    （``retained_count``）；仍同值时，将故障相设备按编号排序，取其相位选择
+    序列字典序最小者（A < B < C < 断开）。返回最终各相负载、迁移分配、断开
+    设备及保留功率。仅做预演，不修改历史计算记录。
+
+    记录不存在返回 404；原记录无可行分配返回 409；故障相位取值非法返回 422。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if not record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录无可行分配，无法进行故障保供预演：id={calculation_id}",
+        )
+
+    devices = [
+        Device(code=d["device_id"], power=d["power"], allowed=tuple(d["allowed_phases"]))
+        for d in record["devices"]
+    ]
+    assignment = {d["device_id"]: d["assigned_phase"] for d in record["devices"]}
+    result = solve_fault_rehearsal(
+        devices, assignment, record["capacities"], fault_phase
+    )
+
+    power_of = {d.code: d.power for d in devices}
+    migrations = [
+        MigrationItem(
+            device_id=code,
+            power=power_of[code],
+            from_phase=fault_phase,
+            to_phase=result.migrations[code],
+        )
+        for code in sorted(result.migrations)
+    ]
+    disconnected = list(result.disconnected)
+    return FaultRehearsalResult(
+        id=record["id"],
+        created_at=record["created_at"],
+        fault_phase=fault_phase,
+        capacities=Loads(**record["capacities"]),
+        base_loads=Loads(**result.base_loads),
+        loads=Loads(**result.loads),
+        migrations=migrations,
+        disconnected_devices=disconnected,
+        retained_power=result.retained_power,
+        retained_count=result.retained_count,
+        disconnected_power=sum(power_of[code] for code in disconnected),
+        disconnected_count=len(disconnected),
+        message=_MESSAGE_FAULT,
     )

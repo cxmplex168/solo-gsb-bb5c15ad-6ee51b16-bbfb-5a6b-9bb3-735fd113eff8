@@ -236,3 +236,44 @@ class StartupPlanResult(BaseModel):
         ..., description="逐步的瞬时与稳定负载；无安全顺序时为空"
     )
     message: str
+
+
+class MigrationItem(BaseModel):
+    """单台故障相设备的迁移结果。"""
+
+    device_id: str
+    power: int = Field(..., description="设备功率")
+    from_phase: Phase = Field(..., description="原接入相位（即故障相）")
+    to_phase: Phase = Field(..., description="迁入的健康相")
+
+
+class FaultRehearsalResult(BaseModel):
+    """单相故障保供预演结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    fault_phase: Phase = Field(..., description="故障相位")
+    capacities: Loads = Field(..., description="各相容量（沿用原计算记录）")
+    base_loads: Loads = Field(
+        ...,
+        description=(
+            "故障发生后的基线负载：健康相设备保持原分配，故障相负载为 0"
+        ),
+    )
+    loads: Loads = Field(
+        ...,
+        description="保供方案下的最终各相负载（故障相必为 0，健康相不超容量）",
+    )
+    migrations: list[MigrationItem] = Field(
+        ..., description="迁移到健康相的故障相设备（按设备编号排序）"
+    )
+    disconnected_devices: list[str] = Field(
+        ..., description="断开的故障相设备编号（按设备编号排序）"
+    )
+    retained_power: int = Field(..., description="保留设备的总功率", ge=0)
+    retained_count: int = Field(..., description="保留设备数", ge=0)
+    disconnected_power: int = Field(
+        ..., description="断开设备的总功率（即损失的供电功率）", ge=0
+    )
+    disconnected_count: int = Field(..., description="断开设备数", ge=0)
+    message: str
